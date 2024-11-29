@@ -2,6 +2,7 @@
 /*
  * Copyright (c) 2015, Sony Mobile Communications AB.
  * Copyright (c) 2012-2013, 2018-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/hwspinlock.h>
@@ -12,6 +13,13 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/soc/qcom/smem.h>
+
+#ifdef OPLUS_FEATURE_AGINGTEST
+#include <linux/string.h>
+#include <linux/kallsyms.h>
+
+#define SMEM_DUMP_INFO    129
+#endif /*OPLUS_FEATURE_AGINGTEST*/
 
 /*
  * The Qualcomm shared memory system is a allocate only heap structure that
@@ -84,6 +92,17 @@
 
 /* Max number of processors/hosts in a system */
 #define SMEM_HOST_COUNT		11
+
+/* Entry range check
+ * ptr >= start : Checks if ptr is greater than the start of access region
+ * ptr + size >= ptr: Check for integer overflow (On 32bit system where ptr
+ * and size are 32bits, ptr + size can wrap around to be a small integer)
+ * ptr + size <= end: Checks if ptr+size is less than the end of access region
+ */
+#define IN_PARTITION_RANGE(ptr, size, start, end)		\
+	(((void *)(ptr) >= (void *)(start)) &&			\
+	 (((void *)(ptr) + (size)) >= (void *)(ptr)) &&	\
+	 (((void *)(ptr) + (size)) <= (void *)(end)))
 
 /**
   * struct smem_proc_comm - proc_comm communication struct (legacy)
@@ -359,6 +378,7 @@ static int qcom_smem_alloc_private(struct qcom_smem *smem,
 				   size_t size)
 {
 	struct smem_private_entry *hdr, *end;
+	struct smem_private_entry *next_hdr;
 	struct smem_partition_header *phdr;
 	size_t alloc_size;
 	void *cached;
@@ -371,18 +391,25 @@ static int qcom_smem_alloc_private(struct qcom_smem *smem,
 	end = phdr_to_last_uncached_entry(phdr);
 	cached = phdr_to_last_cached_entry(phdr);
 
-	if (WARN_ON((void *)end > p_end || (void *)cached > p_end))
+	if (WARN_ON(!IN_PARTITION_RANGE(end, 0, phdr, cached) ||
+						cached > p_end))
 		return -EINVAL;
 
-	while (hdr < end) {
+	while ((hdr < end) && ((hdr + 1) < end)) {
 		if (hdr->canary != SMEM_PRIVATE_CANARY)
 			goto bad_canary;
 		if (le16_to_cpu(hdr->item) == item)
 			return -EEXIST;
 
-		hdr = uncached_entry_next(hdr);
+		next_hdr = uncached_entry_next(hdr);
+
+		if (WARN_ON(next_hdr <= hdr))
+			return -EINVAL;
+
+		hdr = next_hdr;
 	}
-	if (WARN_ON((void *)hdr > p_end))
+
+	if (WARN_ON((void *)hdr > (void *)end))
 		return -EINVAL;
 
 	/* Check that we don't grow into the cached region */
@@ -540,84 +567,105 @@ static void *qcom_smem_get_private(struct qcom_smem *smem,
 				   unsigned item,
 				   size_t *size)
 {
-	struct smem_private_entry *e, *end;
+	struct smem_private_entry *e, *uncached_end, *cached_end;
+	struct smem_private_entry *next_e;
 	struct smem_partition_header *phdr;
 	void *item_ptr, *p_end;
+	size_t entry_size = 0;
+	u32 partition_size;
 	size_t cacheline;
 	u32 padding_data;
 	u32 e_size;
 
 	phdr = p_desc->virt_base;
+	partition_size = le32_to_cpu(p_desc->size);
 	p_end = (void *)phdr + p_desc->size;
 	cacheline = p_desc->cacheline;
 
 	e = phdr_to_first_uncached_entry(phdr);
-	end = phdr_to_last_uncached_entry(phdr);
+	uncached_end = phdr_to_last_uncached_entry(phdr);
+	cached_end = phdr_to_last_cached_entry(phdr);
 
-	if (WARN_ON((void *)end > p_end))
+	if (WARN_ON(!IN_PARTITION_RANGE(uncached_end, 0, phdr, cached_end)
+					|| (void *)cached_end > p_end))
 		return ERR_PTR(-EINVAL);
 
-	while (e < end) {
+	while ((e < uncached_end) && ((e + 1) < uncached_end)) {
 		if (e->canary != SMEM_PRIVATE_CANARY)
 			goto invalid_canary;
 
 		if (le16_to_cpu(e->item) == item) {
-			if (size != NULL) {
-				e_size = le32_to_cpu(e->size);
-				padding_data = le16_to_cpu(e->padding_data);
+			e_size = le32_to_cpu(e->size);
+			padding_data = le16_to_cpu(e->padding_data);
 
-				if (e_size < p_desc->size
-				    && padding_data < e_size)
-					*size = e_size - padding_data;
-				else
-					return ERR_PTR(-EINVAL);
-			}
+			if (e_size < partition_size && padding_data < e_size)
+				entry_size = e_size - padding_data;
+			else
+				return ERR_PTR(-EINVAL);
 
 			item_ptr =  uncached_entry_to_item(e);
-			if (WARN_ON(item_ptr > p_end))
+
+			if (WARN_ON(!IN_PARTITION_RANGE(item_ptr, entry_size, e,
+								uncached_end)))
 				return ERR_PTR(-EINVAL);
+
+			if (size != NULL)
+				*size = entry_size;
 
 			return item_ptr;
 		}
 
-		e = uncached_entry_next(e);
+		next_e = uncached_entry_next(e);
+		if (WARN_ON(next_e <= e))
+			return ERR_PTR(-EINVAL);
+
+		e = next_e;
 	}
-	if (WARN_ON((void *)e > p_end))
+	if (WARN_ON((void *)e > (void *)uncached_end))
 		return ERR_PTR(-EINVAL);
 
 	/* Item was not found in the uncached list, search the cached list */
 
-	e = phdr_to_first_cached_entry(phdr, cacheline);
-	end = phdr_to_last_cached_entry(phdr);
+	if (cached_end == p_end)
+		return ERR_PTR(-ENOENT);
 
-	if (WARN_ON((void *)e < (void *)phdr || (void *)end > p_end))
+	e = phdr_to_first_cached_entry(phdr, cacheline);
+
+	if (WARN_ON(!IN_PARTITION_RANGE(cached_end, 0, uncached_end, p_end) ||
+			!IN_PARTITION_RANGE(e, sizeof(*e), cached_end, p_end)))
 		return ERR_PTR(-EINVAL);
 
-	while (e > end) {
+	while (e > cached_end) {
 		if (e->canary != SMEM_PRIVATE_CANARY)
 			goto invalid_canary;
 
 		if (le16_to_cpu(e->item) == item) {
-			if (size != NULL) {
-				e_size = le32_to_cpu(e->size);
-				padding_data = le16_to_cpu(e->padding_data);
+			e_size = le32_to_cpu(e->size);
+			padding_data = le16_to_cpu(e->padding_data);
 
-				if (e_size < p_desc->size
-				    && padding_data < e_size)
-					*size = e_size - padding_data;
-				else
-					return ERR_PTR(-EINVAL);
-			}
+			if (e_size < partition_size && padding_data < e_size)
+				entry_size  = e_size - padding_data;
+			else
+				return ERR_PTR(-EINVAL);
 
 			item_ptr =  cached_entry_to_item(e);
-			if (WARN_ON(item_ptr < (void *)phdr))
+			if (WARN_ON(!IN_PARTITION_RANGE(item_ptr, entry_size,
+							cached_end, e)))
 				return ERR_PTR(-EINVAL);
+
+			if (size != NULL)
+				*size = entry_size;
 
 			return item_ptr;
 		}
 
-		e = cached_entry_next(e, cacheline);
+		next_e = cached_entry_next(e, cacheline);
+		if (WARN_ON(next_e >= e))
+			return ERR_PTR(-EINVAL);
+
+		e = next_e;
 	}
+
 	if (WARN_ON((void *)e < (void *)phdr))
 		return ERR_PTR(-EINVAL);
 
@@ -776,6 +824,69 @@ phys_addr_t qcom_smem_virt_to_phys(void *p)
 	return 0;
 }
 EXPORT_SYMBOL(qcom_smem_virt_to_phys);
+
+#ifdef OPLUS_FEATURE_AGINGTEST
+static char caller_function_name[KSYM_SYMBOL_LEN];
+char *parse_function_builtin_return_address(unsigned long function_address)
+{
+	char *cur = caller_function_name;
+
+	if (!function_address)
+		return NULL;
+
+	sprint_symbol(caller_function_name, function_address);
+	strsep(&cur, "+");
+
+	return caller_function_name;
+}
+EXPORT_SYMBOL(parse_function_builtin_return_address);
+
+void save_dump_reason_to_smem(char *reason, char *function_name)
+{
+	int reason_len = 0, name_len = 0;
+	int ret;
+	size_t size;
+	static int flag = 0;
+	struct dump_info *dp_info;
+
+	if (flag)
+		return;
+
+	size = sizeof(struct dump_info);
+	ret = qcom_smem_alloc(QCOM_SMEM_HOST_ANY, SMEM_DUMP_INFO, size);
+	if (ret < 0 && ret != -EEXIST) {
+		pr_err("%s:unable to allocate dp_info \n", __func__);
+		return;
+	}
+
+	dp_info = qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_DUMP_INFO, &size);
+	if (IS_ERR_OR_NULL(dp_info))
+		pr_err("%s: get dp_info failure\n", __func__);
+	else {
+		if (reason != NULL) {
+			pr_err("%s: info : %s\n",__func__, reason);
+			reason_len = strlen(reason);
+			reason_len = (reason_len < DUMP_REASON_SIZE)? reason_len:DUMP_REASON_SIZE;
+			if (((strlen(dp_info->dump_reason) + reason_len) < DUMP_REASON_SIZE)) {
+				strcat(dp_info->dump_reason, reason);
+			}
+		}
+		if (function_name != NULL) {
+			name_len = strlen(function_name);
+			name_len = (name_len < DUMP_REASON_SIZE)? name_len:DUMP_REASON_SIZE;
+			if (((strlen(dp_info->dump_reason) + name_len + 1) < DUMP_REASON_SIZE)) {
+				strcat(dp_info->dump_reason, ":");
+				strcat(dp_info->dump_reason, function_name);
+			}
+		}
+	}
+	pr_err("\r%s: dump_reason : %s reason_len=%d function caused panic :%s name_len=%d \n", __func__,
+							(reason != NULL)?reason:"unknown", reason_len, (function_name != NULL)?function_name:"unknown", name_len);
+	/* Make sure save_dump_reason_to_smem() is called only once  during subsystem crash */
+	flag++;
+}
+EXPORT_SYMBOL(save_dump_reason_to_smem);
+#endif /*OPLUS_FEATURE_AGINGTEST*/
 
 static int qcom_smem_get_sbl_version(struct qcom_smem *smem)
 {
