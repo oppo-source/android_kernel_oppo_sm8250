@@ -66,7 +66,7 @@ static atomic_long_t fillthread_runtime_times[NUM_ORDERS]
 
 static int page_pool_fill(struct ux_page_pool *pool, int migratetype);
 
-int ux_page_pool_enable = 1;
+int ux_page_pool_enable = 0;
 
 bool get_critical_zeroslowpath_task_flag(struct task_struct *tsk)
 {

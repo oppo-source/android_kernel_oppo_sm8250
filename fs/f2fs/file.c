@@ -60,12 +60,17 @@ struct page_list {
 };
 static struct kmem_cache *page_info_slab;
 
+bool may_compress = false;
+bool may_set_compr_fl = false;
+
 #define LOG_PAGE_INTO_LIST(head, page)	do {			\
 	struct page_list *tmp;					\
 	tmp = f2fs_kmem_cache_alloc(page_info_slab, GFP_NOFS);	\
-	tmp->page = page;					\
-	INIT_LIST_HEAD(&tmp->list);				\
-	list_add_tail(&tmp->list, &head);			\
+	if (tmp) {						\
+		tmp->page = page;					\
+		INIT_LIST_HEAD(&tmp->list);				\
+		list_add_tail(&tmp->list, &head);			\
+	}							\
 } while (0)
 
 #define FREE_FIRST_PAGE_IN_LIST(head)	do {			\
@@ -1517,8 +1522,10 @@ static int f2fs_ioc_dedup_file(struct file *filp, unsigned long arg)
 
 	dir = dget_parent(file_dentry(filp));
 	inner_inode = get_inner_inode(base_inode);
-	ret = is_inode_match_dir_crypt_policy(dir, inner_inode);
-	put_inner_inode(inner_inode);
+	if (likely(inner_inode)) {
+		ret = is_inode_match_dir_crypt_policy(dir, inner_inode);
+		put_inner_inode(inner_inode);
+	}
 	dput(dir);
 	if (ret)
 		goto unlock1;
@@ -2579,8 +2586,8 @@ int f2fs_getattr(const struct path *path, struct kstat *stat,
 	}
 
 	flags = fi->i_flags;
-	//if (flags & F2FS_COMPR_FL)
-	//	stat->attributes |= STATX_ATTR_COMPRESSED;
+	if ((flags & F2FS_COMPR_FL) && may_compress)
+		stat->attributes |= STATX_ATTR_COMPRESSED;
 	if (flags & F2FS_APPEND_FL)
 		stat->attributes |= STATX_ATTR_APPEND;
 	if (IS_ENCRYPTED(inode))
@@ -3702,6 +3709,10 @@ static int f2fs_setflags_common(struct inode *inode, u32 iflags, u32 mask)
 				return err;
 			if (!f2fs_may_compress(inode))
 				return -EINVAL;
+			if (S_ISREG(inode->i_mode) && inode->i_size)
+				return -EINVAL;
+			if (!may_set_compr_fl)
+				return -EOPNOTSUPP;
 			if (set_compress_context(inode))
 				return -EOPNOTSUPP;
 		}
@@ -3821,7 +3832,8 @@ static int f2fs_ioc_getflags(struct file *filp, unsigned long arg)
 		fsflags |= FS_INLINE_DATA_FL;
 	if (is_inode_flag_set(inode, FI_PIN_FILE))
 		fsflags |= FS_NOCOW_FL;
-	fsflags &= ~FS_COMPR_FL;
+	if (!may_compress)
+		fsflags &= ~FS_COMPR_FL;
 
 	fsflags &= F2FS_GETTABLE_FS_FL;
 
@@ -5162,6 +5174,10 @@ static int end_file_merge(struct file *filp, unsigned long arg)
 			goto fail;
 		}
 
+#ifdef CONFIG_F2FS_FS_DEDUP
+		if (f2fs_inode_support_dedup(sbi, inode))
+			set_inode_flag(inode, FI_DATA_UN_MODIFY);
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 		f2fs_file_read_pages(inode_source);
 #endif
@@ -5173,6 +5189,18 @@ static int end_file_merge(struct file *filp, unsigned long arg)
 					f2fs_show_injection_info(sbi, FAULT_PAGE_ERROR);
 					page = ERR_PTR(-EIO);
 				} else {
+#ifdef CONFIG_F2FS_FS_COMPRESSION
+					if (f2fs_compressed_file(inode_source) &&
+						f2fs_is_compressed_cluster(inode_source,
+							fm_ext_node->extent.index + k)) {
+						f2fs_warn(sbi, "f2fs_ioc_end_file_merge ino = %u,(%d, %d) is compressed\n",
+								cur_merge_file->ino, fm_ext_node->extent.index, k);
+						inode_unlock(inode_source);
+						iput(inode_source);
+						ret = -EKEYEXPIRED;
+						goto fail;
+					}
+#endif
 					page = f2fs_get_lock_data_page(inode_source, fm_ext_node->extent.index + k, false);
 				}
 				if (IS_ERR(page)) {
@@ -5286,6 +5314,11 @@ static int end_file_merge(struct file *filp, unsigned long arg)
 		}
 	}
 
+#ifdef CONFIG_F2FS_FS_DEDUP
+	if (f2fs_inode_support_dedup(sbi, inode))
+		set_inode_flag(inode, FI_MERGED_FILE);
+#endif
+
 	ret = merge_sync_file(sbi, filp);
 	if (ret)
 		goto fail;
@@ -5293,7 +5326,7 @@ static int end_file_merge(struct file *filp, unsigned long arg)
 	offset = tail;
 	if (time_to_inject(sbi, FAULT_WRITE_TAIL_ERROR)) {
 		f2fs_show_injection_info(sbi, FAULT_WRITE_TAIL_ERROR);
-		summary->checksum = F2FS_BOOSTFILE_VERSION;
+		summary_dinfo->checksum = F2FS_BOOSTFILE_VERSION;
 	}
 	result = f2fs_file_write(filp, offset, (unsigned char *)summary_dinfo,
 				 sizeof(struct merge_summary_dinfo));
@@ -5442,6 +5475,14 @@ static int f2fs_ioc_preload_file(struct file *filp, unsigned long arg)
 	if (!inode_trylock(inode))
 		return -EAGAIN;
 
+#ifdef CONFIG_F2FS_FS_DEDUP
+	if (f2fs_inode_support_dedup(sbi, inode) &&
+			!is_inode_flag_set(inode, FI_MERGED_FILE)) {
+		f2fs_err(sbi, "merged file has something wrong\n");
+		ret = -EKEYEXPIRED;
+		goto fail;
+	}
+#endif
 	if (atomic_read(&(F2FS_I(inode)->appboost_abort))) {
 		atomic_set(&(F2FS_I(inode)->appboost_abort), 0);
 		ret = -EAGAIN;
@@ -5568,6 +5609,15 @@ static int f2fs_ioc_preload_file(struct file *filp, unsigned long arg)
 			ret = -EKEYEXPIRED;
 			goto fail_unlock_source;
 		}
+
+#ifdef CONFIG_F2FS_FS_DEDUP
+		if (f2fs_inode_support_dedup(sbi, inode) &&
+				!is_inode_flag_set(inode, FI_DATA_UN_MODIFY)) {
+			f2fs_err(sbi, "source file has modified\n");
+			ret = -EKEYEXPIRED;
+			goto fail_unlock_source;
+		}
+#endif
 
 		ret = fscrypt_require_key(inode_source);
 		if (ret) {
@@ -6754,11 +6804,6 @@ static int f2fs_release_compress_blocks(struct file *filp, unsigned long arg)
 
 	inode_lock(inode);
 
-	f2fs_info(sbi, "start release cblocks ino %lu (%pd) size %llu blocks %llu "
-		"cblocks %d\n", inode->i_ino, file_dentry(filp),
-		i_size_read(inode), inode->i_blocks,
-		F2FS_I(inode)->i_compr_blocks);
-
 	writecount = atomic_read(&inode->i_writecount);
 	if ((filp->f_mode & FMODE_WRITE && writecount != 1) ||
 			(!(filp->f_mode & FMODE_WRITE) && writecount)) {
@@ -6779,6 +6824,11 @@ static int f2fs_release_compress_blocks(struct file *filp, unsigned long arg)
 		ret = -EPERM;
 		goto out;
 	}
+
+	f2fs_info(sbi, "start release cblocks ino %lu (%pd) size %llu blocks %llu "
+		"cblocks %d\n", inode->i_ino, file_dentry(filp),
+		i_size_read(inode), inode->i_blocks,
+		F2FS_I(inode)->i_compr_blocks);
 
 	set_inode_flag(inode, FI_COMPRESS_RELEASED);
 	inode->i_ctime = current_time(inode);
@@ -6822,11 +6872,13 @@ static int f2fs_release_compress_blocks(struct file *filp, unsigned long arg)
 
 	up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
 	up_write(&F2FS_I(inode)->i_mmap_sem);
-out:
+
 	f2fs_info(sbi, "end release cblocks ino %lu (%pd) size %llu blocks %llu "
 		"cblocks %d rblocks %u ret %d\n", inode->i_ino, file_dentry(filp),
 		i_size_read(inode), inode->i_blocks,
 		F2FS_I(inode)->i_compr_blocks, released_blocks, ret);
+
+out:
 	inode_unlock(inode);
 
 	mnt_drop_write_file(filp);
@@ -7065,8 +7117,9 @@ static int f2fs_set_compress_option_v2(struct file *filp,
 		if (!f2fs_is_compress_level_valid(option.algorithm,
 						  option.level))
 			return -EINVAL;
-		if (option.flag > BIT(COMPRESS_MAX_FLAG) - 1)
-			return -EINVAL;
+		/* fix coverity error: Operands don't affect result, COMPRESS_MAX_FLAG==9, always false*/
+		//if (option.flag > BIT(COMPRESS_MAX_FLAG) - 1)
+		//	return -EINVAL;
 	}
 
 	file_start_write(filp);
@@ -7243,6 +7296,16 @@ int f2fs_decompress_inode(struct inode *inode)
 	int cluster_size = F2FS_I(inode)->i_cluster_size;
 	int count, ret;
 
+	if (is_inode_flag_set(inode, FI_COMPRESS_RELEASED))
+		return -EPERM;
+
+	ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
+	if (ret)
+		return ret;
+
+	if (!fi->i_compr_blocks)
+		return 0;
+
 	f2fs_info(sbi, "start decompress ino %lu size %llu blocks %llu "
 		"cblocks %d caller %ps\n", inode->i_ino, i_size_read(inode),
 		inode->i_blocks, F2FS_I(inode)->i_compr_blocks,
@@ -7250,13 +7313,6 @@ int f2fs_decompress_inode(struct inode *inode)
 
 	clear_inode_flag(inode, FI_ENABLE_COMPRESS);
 	inode->i_ctime = current_time(inode);
-
-	ret = filemap_write_and_wait_range(inode->i_mapping, 0, LLONG_MAX);
-	if (ret)
-		goto out_fail_write;
-
-	if (!fi->i_compr_blocks)
-		return 0;
 
 	last_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 
@@ -7293,7 +7349,6 @@ out:
 		f2fs_warn(sbi, "%s: The file might be partially decompressed "
 				"(errno=%d). Please delete the file.\n",
 				__func__, ret);
-out_fail_write:
 	f2fs_info(sbi, "end decompress ino %lu size %llu blocks %llu cblocks %d ret %d\n",
 		inode->i_ino, i_size_read(inode), inode->i_blocks,
 		F2FS_I(inode)->i_compr_blocks, ret);
@@ -7360,7 +7415,7 @@ static int f2fs_ioc_compress_file(struct file *filp, unsigned long arg)
 	int cluster_size = F2FS_I(inode)->i_cluster_size;
 	int count, ret;
 
-	if (!f2fs_sb_has_compression(sbi) || filp ||
+	if (!f2fs_sb_has_compression(sbi) || !may_compress ||
 			F2FS_OPTION(sbi).compress_mode != COMPR_MODE_USER)
 		return -EOPNOTSUPP;
 
@@ -7558,6 +7613,9 @@ static int f2fs_ioc_get_extra_attr(struct file *filp, unsigned long arg)
 		ret = f2fs_get_compress_blocks(inode, &attr.attr);
 		break;
 	case F2FS_EXTRA_ATTR_COMPR_OPTION:
+		/* fix coverity error: Untrusted value as argument attr.attr_size*/
+		if (attr.attr_size > sizeof(struct f2fs_comp_option_v2))
+			return -EINVAL;
 		ret = f2fs_get_compress_option_v2(filp, attr.attr,
 						  &attr.attr_size);
 		break;
@@ -7653,6 +7711,9 @@ xattr_out_unlock:
 			f2fs_balance_fs(sbi, true);
 		break;
 	case F2FS_EXTRA_ATTR_COMPR_OPTION:
+		/* fix coverity error: Untrusted value as argument attr.attr_size*/
+		if (attr.attr_size > sizeof(struct f2fs_comp_option_v2))
+			return -EINVAL;
 		ret = f2fs_set_compress_option_v2(filp, attr.attr,
 						  &attr.attr_size);
 		break;

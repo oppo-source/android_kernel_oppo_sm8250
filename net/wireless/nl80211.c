@@ -14691,7 +14691,6 @@ void nl80211_send_connect_result(struct cfg80211_registered_device *rdev,
 	    (cr->bssid &&
 	     nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN, cr->bssid)) ||
 	    nla_put_u16(msg, NL80211_ATTR_STATUS_CODE,
-			cr->status < 0 ? WLAN_STATUS_UNSPECIFIED_FAILURE :
 			cr->status) ||
 	    (cr->status < 0 &&
 	     (nla_put_flag(msg, NL80211_ATTR_TIMED_OUT) ||

@@ -3,7 +3,7 @@
  *
  * Copyright 2018 Texas Instruments
  *
- * Author: LiPing-m <LiPing-m@oppo.com>
+ * Author: LiPing-m
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
